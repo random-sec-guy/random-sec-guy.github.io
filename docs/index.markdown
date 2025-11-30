@@ -5,5 +5,5 @@
 layout: home
 ---
 
-hello
+Post index
 
